@@ -14,7 +14,7 @@ LDLIBS = -lpcap -lpthread -lm
 APP = iron_gen
 
 # all source are stored in SRCS-y
-SRCS-y := src/irongen.c 
+SRCS-y := src/irongen.c
 
 CFLAGS += -O3
 #CFLAGS += -g

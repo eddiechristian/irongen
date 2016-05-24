@@ -1,0 +1,88 @@
+==================================================================================================
+##05/19/2016 With one thread I could run dns at 500-600k pps on one thread with following config on
+##sensor 2 s4.
+
+{
+  "sensor_id": "831146077f590af418d8e035dd9e5b10",
+  "pfring_zc": {
+    "devices": [
+        "zc:p1p1"
+    ],
+    "threads": 1,
+    "queue_size": 10000000,
+    "packet_pool": 0.3,
+    "packet_pool_upgrade_timer": 10000,
+    "numa_node": 0,
+    "flow_builder": {
+        "ndpi": true,
+        "process_timer": 1000,
+        "slices": {
+          "timeout": 5000
+        },
+        "inactive_timeout": 30000,
+        "parse": {
+          "ephemeral_start": 49000,
+          "tls_certs": false,
+          "smb": false
+        }
+    },
+    "pcap_builder": {
+        "pool_size": 5,
+        "output_paths": [
+            "/mnt/pcap"
+        ],
+        "duration_hours": 168,
+        "queue_limit": 100000000,
+  "owner": {
+    "user": 330,
+    "group": 330
+  },
+  "initial_index_map_capacity": 200
+}
+},
+"nsq": {
+"flow_slice": {
+  "topic": "PartialFlows",
+  "servers": [
+    "172.16.1.122:4150"
+  ]
+},
+"closed_flow": {
+  "topic": "PartialFlows",
+  "servers": [
+    "172.16.1.122:4150"
+  ]
+}
+},
+"log": {
+"update_freq": 1000,
+"clear": false,
+"app": {
+"std_log": {
+  "level": "warn"
+},
+"log_file": {
+       "path": "/var/log/ironsensor/logs",
+       "size": 100000000,
+       "symlink": "/var/log/ironsensor/log"
+     },
+     "stat_file": {
+       "app_name": "ironsensor",
+       "path": "/var/log/ironsensor/stats",
+       "size": 100000000,
+       "symlink": "/var/log/ironsensor/stat"
+     }
+   }
+ }
+}
+
+./build/iron_gen  --huge-dir /mnt/huge -c 0x3 -n 4  -- -f /opt/iron_gen/dns.pcap  -t 10000  -s 2 -r 0.5
+
+==================================================================================================
+
+##05/19/2016 With one thread I crash after about 10 min with rates above 2.0, with nsq off, 1 thread, pcap off.
+
+
+./build/iron_gen  --huge-dir /mnt/huge -c 0x3 -n 4  -- -f /opt/iron_gen/http_single.pcap  -t 10000  -s 1 -r 3.0
+
+==================================================================================================

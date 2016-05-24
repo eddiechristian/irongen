@@ -11,8 +11,7 @@
 #define MAX_NUM_PCAP_PACKETS 100 //maximum number of frames in pcap file.
 
 static int g_shutdown = 0;
-static struct app_stats* g_new_stats = NULL;
-static struct app_stats* g_old_stats = NULL;
+
 static char * g_file_name = NULL;
 static uint64_t g_buffer_size = 1048576;
 static uint64_t g_num_packets =0;
@@ -25,9 +24,79 @@ static int g_times = 1;
 struct timeval g_start_time;
 struct pcap_entry* pcap_cache[MAX_NUM_PCAP_PACKETS];
 
+uint64_t g_num_pkt_sent = 0;
+uint64_t g_num_bytes_sent = 0;
+uint64_t g_old_num_pkts_sent = 0;
+uint64_t g_old_num_bytes_sent = 0;
+struct timeval start_time;
+struct timeval last_time;
+
+void compute_tcp_checksum(struct iphdr *pIph, unsigned short *ipPayload) {
+    register unsigned long sum = 0;
+    unsigned short tcpLen = ntohs(pIph->tot_len) - (pIph->ihl<<2);
+    struct tcphdr *tcphdrp = (struct tcphdr*)(ipPayload);
+    //add the pseudo header
+    //the source ip
+    sum += (pIph->saddr>>16)&0xFFFF;
+    sum += (pIph->saddr)&0xFFFF;
+    //the dest ip
+    sum += (pIph->daddr>>16)&0xFFFF;
+    sum += (pIph->daddr)&0xFFFF;
+    //protocol and reserved: 6
+    sum += htons(IPPROTO_TCP);
+    //the length
+    sum += htons(tcpLen);
+
+    //add the IP payload
+    //initialize checksum to 0
+    tcphdrp->check = 0;
+    while (tcpLen > 1) {
+        sum += * ipPayload++;
+        tcpLen -= 2;
+    }
+    //if any bytes left, pad the bytes and add
+    if(tcpLen > 0) {
+        //printf("+++++++++++padding, %dn", tcpLen);
+        sum += ((*ipPayload)&htons(0xFF00));
+    }
+      //Fold 32-bit sum to 16 bits: add carrier to result
+      while (sum>>16) {
+          sum = (sum & 0xffff) + (sum >> 16);
+      }
+      sum = ~sum;
+    //set computation result
+    tcphdrp->check = (unsigned short)sum;
+}
+
+uint16_t _bswap16(uint16_t a)
+{
+  a = ((a & 0x00FF) << 8) | ((a & 0xFF00) >> 8);
+  return a;
+}
+
+
+csum (unsigned short *buf, int nwords)
+{
+  unsigned long sum;
+  for (sum = 0; nwords > 0; nwords--){
+    unsigned short val=*buf;
+    sum += _bswap16(val);
+    //printf("%#04x\n",val);
+    //sum += val;
+    buf++;
+    //printf("\n\n");
+}
+  sum = (sum >> 16) + (sum & 0xffff);
+  sum += (sum >> 16);
+  return ~sum;
+}
+
+
 static int main_loop_producer(__attribute__((unused)) void * arg){
   char ebuf[256];
-  int ret = 1;;
+  int ret = 1;
+  int index = 0;
+  struct rte_mbuf * m;
   struct pcap_pkthdr *pcaphdrptr;
 	void * pkt;
   /* Open the trace */
@@ -38,27 +107,43 @@ static int main_loop_producer(__attribute__((unused)) void * arg){
     exit(1);
   }
 
-  // while(ret == 1){
-  //   ret = pcap_next_ex(pt, &pcaphdrptr, (const u_char**)&pkt);
-  //   pcap_cache[g_num_packets] = (struct pcap_entry*) rte_zmalloc("new pcap entry alloc",sizeof(struct pcap_entry),0);
-  //   pcap_cache[g_num_packets]->caplen = pcaphdrptr->caplen;
-  //   pcap_cache[g_num_packets]->capbytes = (char*) rte_zmalloc("new pcap bytes alloc",pcaphdrptr->caplen,0);
-  //   rte_memcpy ( pcap_cache[g_num_packets]->capbytes, pkt, pcap_cache[g_num_packets]->caplen);
-  //   g_num_packets++;
-  //   if (g_num_packets == 1){
-  //     printf("len = %d bytes = %#010x\n",pcap_cache[g_num_packets]->caplen,pcap_cache[g_num_packets]->capbytes);
-  //   }
-  // }
+  while(ret == 1){
+    ret = pcap_next_ex(pt, &pcaphdrptr, (const u_char**)&pkt);
+    pcap_cache[g_num_packets] = (struct pcap_entry*) malloc(sizeof(struct pcap_entry));
+    pcap_cache[g_num_packets]->caplen = pcaphdrptr->caplen;
+    pcap_cache[g_num_packets]->capbytes = (char*) malloc(pcaphdrptr->caplen);
+    memcpy ( pcap_cache[g_num_packets]->capbytes, pkt, pcap_cache[g_num_packets]->caplen);
+    if (g_num_packets == 1){
+      printf("len = %d bytes = %#010x\n",pcap_cache[g_num_packets]->caplen,pcap_cache[g_num_packets]->capbytes);
+    }
+    g_num_packets++;
+    if (g_num_packets == MAX_NUM_PCAP_PACKETS){
+      printf("only sending the first %d packets from pcap file %s",MAX_NUM_PCAP_PACKETS,g_file_name);
+      break;
+    }
+  }
   pcap_close(pt);
-
+  g_num_packets--;
   if(ret <= 0) {
     if (ret==-2){
-      printf("read %d packets from file",g_num_packets);
+      printf("read %d packets from file\n",g_num_packets);
     }
     if (ret==-1) FATAL_ERROR("Error in pcap: %s\n", pcap_geterr(pt));
 
   }
-  sig_handler(SIGINT);
+
+  while(1){
+
+    while( (m =  rte_pktmbuf_alloc 	(g_pktmbuf_pool)) == NULL) {}
+
+    while (rte_mempool_free_count (g_pktmbuf_pool) > g_buffer_size*BUFFER_RATIO ) {}
+    m->data_len = m->pkt_len = pcap_cache[index]->caplen;
+    rte_memcpy ( (char*) m->buf_addr + m->data_off, pcap_cache[index]->capbytes, pcap_cache[index]->caplen);
+    index = (index +1) % g_num_packets;
+    /* Enqueue it */
+    ret = rte_ring_enqueue (g_intermediate_ring, m);
+  }
+
 }
 
 /* Loop function, batch timing implemented */
@@ -78,11 +163,11 @@ static int main_loop_consumer(__attribute__((unused)) void * arg){
 		ix = 0;
 	}
 
-	/* Init start time */
-	ret = gettimeofday(&g_start_time, NULL);
-	if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
-	g_old_stats->last_time = g_start_time;
-	tick_start =   rte_get_tsc_cycles();
+    /* Init start time */
+  ret = gettimeofday(&start_time, NULL);
+  if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
+  last_time = start_time;
+  tick_start =   rte_get_tsc_cycles();
 
 	/* Start stats */
    	alarm(1);
@@ -100,20 +185,23 @@ static int main_loop_consumer(__attribute__((unused)) void * arg){
 
 		length = m->data_len;
 
+
+
+
 		/* For each received packet. */
 		for (i = 0; likely( i < g_nb_sys_ports * g_times ) ; i++) {
 
 			/* Add a number to ip address if needed */
 			ip_h = (struct ipv4_hdr*)((char*) m->buf_addr + m->data_off + sizeof(struct  ether_hdr));
 			if (g_sum_value > 0){
-				ip_h->src_addr+=g_sum_value*256*256*256;
-				ip_h->dst_addr+=g_sum_value*256*256*256;
+				ip_h->src_addr+=g_sum_value*256*256;
+				ip_h->dst_addr+=g_sum_value*256*256;
         ip_h->hdr_checksum = 0;
-        m->ol_flags |=  PKT_TX_IP_CKSUM | PKT_TX_TCP_CKSUM;
-        // ip_h->hdr_checksum =  _bswap16(csum((unsigned short*)ip_h,10));
-        // char * ip_payload = (char*)ip_h;
-        // ip_payload+=20;
-        // compute_tcp_checksum(ip_h,(unsigned short*)ip_payload);
+        //m->ol_flags |=  PKT_TX_IP_CKSUM | PKT_TX_TCP_CKSUM;
+         ip_h->hdr_checksum =  _bswap16(csum((unsigned short*)ip_h,10));
+         char * ip_payload = (char*)ip_h;
+         ip_payload+=20;
+         compute_tcp_checksum(ip_h,(unsigned short*)ip_payload);
 			}
 
 
@@ -141,29 +229,29 @@ static int main_loop_consumer(__attribute__((unused)) void * arg){
 
 		}
 
-		/* Rate set */
-		if(g_rate > 0) {
-			/* Adjust the rate every 100 packets sent */
-			if (ix++%1 ==0){
-				/* Calculate the actual rate */
-				ret = gettimeofday(&now, NULL);
-				if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
-        deltaMillisec =  (now.tv_sec - g_old_stats->last_time.tv_sec ) * 1000 + (now.tv_usec - g_old_stats->last_time.tv_usec ) / 1000 ;
+    /* Rate set */
+  		if(g_rate > 0) {
+  			/* Adjust the rate every 100 packets sent */
+  			if (ix++%1 ==0){
+  				/* Calculate the actual rate */
+  				ret = gettimeofday(&now, NULL);
+  				if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
 
-				real_rate = (double)(g_new_stats->num_bytes_sent * 1000)/deltaMillisec * 8/(1000*1000*1000);
-				mult = mult + (real_rate - g_rate); // CONTROL LAW;
+  				deltaMillisec = (double)(now.tv_sec - start_time.tv_sec ) * 1000 + (double)(now.tv_usec - start_time.tv_usec ) / 1000 ;
+  				real_rate = (double)(g_num_bytes_sent * 1000)/deltaMillisec * 8/(1000*1000*1000);
+  				mult = mult + (real_rate - g_rate); // CONTROL LAW;
 
-				/* Avoid negative numbers. Avoid problems when the NICs are stuck for a while */
-				if (mult < 0) mult = 0;
-			}
-			/* Wait to adjust the rate*/
-			while(( rte_get_tsc_cycles() - tick_start) < (g_new_stats->num_bytes_sent * mult / g_rate ))
-				if (unlikely(g_shutdown)) break;
-		}
+  				/* Avoid negative numbers. Avoid problems when the NICs are stuck for a while */
+  				if (mult < 0) mult = 0;
+  			}
+  			/* Wait to adjust the rate*/
+  			while(( rte_get_tsc_cycles() - tick_start) < (g_num_bytes_sent * mult / g_rate ))
+  				if (unlikely(g_shutdown)) break;
+  		}
 
-		/* Update stats */
-		g_new_stats->num_pkts_sent += g_times;
-		g_new_stats->num_bytes_sent += (m->data_len + 24) * g_times; /* 8 Preamble + 4 CRC + 12 IFG*/
+  		/* Update stats */
+  		g_num_pkt_sent+= g_times;
+  		g_num_bytes_sent += (m->data_len + 24) * g_times; /* 8 Preamble + 4 CRC + 12 IFG*/
 
 	}
 
@@ -205,15 +293,6 @@ int main(int argc, char **argv)
   if (g_pktmbuf_pool == NULL) FATAL_ERROR("Cannot create cluster_mem_pool. \n");
 
 
-  g_new_stats = (struct app_stats*) rte_malloc_socket("new stat alloc",sizeof(struct app_stats),0,rte_socket_id());
-  if(g_new_stats == NULL) FATAL_ERROR("Cannot allocate new stats\n");
-  printf("test2 %llx \n",g_new_stats);
-  g_new_stats->num_pkts_sent = 5;
-
-  g_old_stats = (struct app_stats*) rte_zmalloc("old stat alloc",sizeof(struct app_stats),0);
-  if(g_old_stats == NULL) FATAL_ERROR("Cannot allocate old stats\n");
-
-
   /* Create a ring for exchanging packets between cores, and allocating on the current NUMA node */
 	g_intermediate_ring = rte_ring_create 	(RING_NAME, g_buffer_size, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ );
  	if (g_intermediate_ring == NULL ) FATAL_ERROR("Cannot create ring");
@@ -224,11 +303,11 @@ int main(int argc, char **argv)
 		init_port(i);
 
 	/* Start consumer and producer routine on 2 different cores: producer launched first... */
-	//ret =  rte_eal_mp_remote_launch (main_loop_producer, NULL, SKIP_MASTER);
-	//if (ret != 0) FATAL_ERROR("Cannot start consumer thread\n");
+	ret =  rte_eal_mp_remote_launch (main_loop_producer, NULL, SKIP_MASTER);
+	if (ret != 0) FATAL_ERROR("Cannot start consumer thread\n");
 
 	/* ... and then loop in consumer */
-	//main_loop_consumer ( NULL );
+	main_loop_consumer ( NULL );
 
 
 }
@@ -245,19 +324,19 @@ void print_stats (void){
 	if (ret != 0) FATAL_ERROR("Error: gettimeofday failed. Quitting...\n");
 
 	/* Compute stats */
-	delta_ms =  (now_time.tv_sec - g_old_stats->last_time.tv_sec ) * 1000 + (now_time.tv_usec - g_old_stats->last_time.tv_usec ) / 1000 ;
-	tot_ms = (now_time.tv_sec - g_start_time.tv_sec ) * 1000 + (now_time.tv_usec - g_start_time.tv_usec ) / 1000 ;
-	gbps_inst = (double)(g_new_stats->num_bytes_sent - g_old_stats->num_bytes_sent)/delta_ms/1000000*8;
-	gbps_tot = (double)(g_new_stats->num_bytes_sent)/tot_ms/1000000*8;
-	mpps_inst = (double)(g_new_stats->num_pkts_sent - g_old_stats->num_pkts_sent)/delta_ms/1000;
-	mpps_tot = (double)(g_new_stats->num_pkts_sent)/tot_ms/1000;
+	delta_ms =  (now_time.tv_sec - last_time.tv_sec ) * 1000 + (now_time.tv_usec - last_time.tv_usec ) / 1000 ;
+	tot_ms = (now_time.tv_sec - start_time.tv_sec ) * 1000 + (now_time.tv_usec - start_time.tv_usec ) / 1000 ;
+	gbps_inst = (double)(g_num_bytes_sent - g_old_num_bytes_sent)/delta_ms/1000000*8;
+	gbps_tot = (double)(g_num_bytes_sent)/tot_ms/1000000*8;
+	mpps_inst = (double)(g_num_pkt_sent - g_old_num_pkts_sent)/delta_ms/1000;
+	mpps_tot = (double)(g_num_pkt_sent)/tot_ms/1000;
 
-	printf("Rate: %8.3fGbps  %8.3fMpps [Average rate: %8.3fGbps  %8.3fMpps], Buffer: %8.3f%% ", gbps_inst, mpps_inst, gbps_tot, mpps_tot, (double)rte_mempool_free_count (g_pktmbuf_pool)/g_buffer_size*100.0 );
+	printf("Rate: %8.3fGbps  %8.3fMpps [Average rate: %8.3fGbps  %8.3fMpps], Buffer: %8.3f%% \n", gbps_inst, mpps_inst, gbps_tot, mpps_tot, (double)rte_mempool_free_count (g_pktmbuf_pool)/g_buffer_size*100.0 );
 
 	/* Update counters */
-  g_old_stats->num_pkts_sent = g_new_stats->num_pkts_sent;
-  g_old_stats->num_bytes_sent = g_new_stats->num_bytes_sent;
-	g_old_stats->last_time = now_time;
+	g_old_num_bytes_sent = g_num_bytes_sent;
+	g_old_num_pkts_sent = g_num_pkt_sent;
+	last_time = now_time;
 
 }
 
